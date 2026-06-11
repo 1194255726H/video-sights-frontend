@@ -53,6 +53,19 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (currentPath.startsWith(LABEL_PATH) && !activeProject) {
+      const taskId = currentPath.split('/')[2]
+      if (taskId && projects.length > 0) {
+        const task = projects.find((p) => p.id === parseInt(taskId, 10))
+        if (task) {
+          const taskProject = backendApi.openHistoryTask(task)
+          setActiveProject(taskProject)
+        }
+      }
+    }
+  }, [currentPath, activeProject, projects])
+
+  useEffect(() => {
     if (!isAuthReady) return
 
     if (currentPath === '/') {
@@ -161,7 +174,7 @@ function App() {
         const taskProject = task ? backendApi.openHistoryTask(task) : await backendApi.grabTask()
         setActiveProject(taskProject)
         setWorkspaceMode('label')
-        navigate(LABEL_PATH)
+        navigate(`${LABEL_PATH}/${task.id}`)
       } catch (error) {
         setProjectError(error instanceof Error ? error.message : '开始标注失败')
       } finally {
@@ -218,7 +231,7 @@ function App() {
     )
   }
 
-  if (isAuthenticated && currentUser && currentPath === LABEL_PATH) {
+  if (isAuthenticated && currentUser && currentPath.startsWith(LABEL_PATH)) {
     const project = activeProject
     if (!project) {
       return (

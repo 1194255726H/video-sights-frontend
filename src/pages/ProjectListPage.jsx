@@ -92,7 +92,7 @@ function ProjectListPage({
               <span className="history-icon">↺</span>
               <h2>历史标注</h2>
             </div>
-            <div className="history-tabs">
+            {/* <div className="history-tabs">
               {tabs.map((tab) => (
                 <button
                   className={`history-tab ${activeTab === tab.key ? 'active' : ''}`}
@@ -103,7 +103,7 @@ function ProjectListPage({
                   {tab.label}
                 </button>
               ))}
-            </div>
+            </div> */}
           </div>
 
           <div className="history-filter">

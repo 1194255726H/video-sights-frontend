@@ -784,7 +784,7 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
             返回列表
           </button>
           <span>{user.name}</span>
-          <span>{ROLE_LABELS[user.role]}</span>
+          {/* <span>{ROLE_LABELS[user.role]}</span> */}
           <span>{mode === 'review' ? '审核' : '标注'}</span>
           <span>{project.name}</span>
           <span>
