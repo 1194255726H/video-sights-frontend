@@ -153,4 +153,17 @@ export const backendApi = {
       body: JSON.stringify(auditData),
     })
   },
+
+  async getHandposeMeta(taskId) {
+    const data = await request(`/api/tasks/${taskId}/handpose_meta/`)
+    return data
+  },
+
+  async getHandposeData(taskId, hand, joint) {
+    const params = new URLSearchParams()
+    if (hand) params.set('hand', hand)
+    if (joint) params.set('joint', joint)
+    const data = await request(`/api/tasks/${taskId}/handpose/?${params.toString()}`)
+    return data
+  },
 }

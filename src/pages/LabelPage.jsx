@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import logoUrl from '../assets/logo.jpg'
-import { ROLE_LABELS, projectApi } from '../mock/localData'
+import HandposeChartModal from '../components/HandposeChartModal'
+import { projectApi } from '../mock/localData'
 
 const FRAME_SECONDS = 4
 const RANGE_CHUNK_SIZE = 16 * 1024 * 1024
@@ -8,6 +9,9 @@ const RANGE_RETRY_LIMIT = 3
 const FULL_RESPONSE_RETRY_LIMIT = 1
 const THUMBNAIL_QUALITY = 0.92
 const SEEK_TIMEOUT_MS = 8000
+const VIDEO_CACHE_DB_NAME = 'secshot-video-cache'
+const VIDEO_CACHE_STORE_NAME = 'videos'
+const VIDEO_CACHE_MAX_ENTRIES = 5
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value))
@@ -80,7 +84,96 @@ function shouldRetryAfterProgress(hasProgress, retryCount, limit) {
   return hasProgress && retryCount < limit
 }
 
-async function fetchVideoAsBlob(url, signal, onProgress) {
+function openVideoCacheDb() {
+  return new Promise((resolve, reject) => {
+    if (!('indexedDB' in window)) {
+      reject(new Error('IndexedDB is unavailable'))
+      return
+    }
+
+    const request = window.indexedDB.open(VIDEO_CACHE_DB_NAME, 1)
+    request.onupgradeneeded = () => {
+      const db = request.result
+      if (!db.objectStoreNames.contains(VIDEO_CACHE_STORE_NAME)) {
+        const store = db.createObjectStore(VIDEO_CACHE_STORE_NAME, { keyPath: 'episodeId' })
+        store.createIndex('updatedAt', 'updatedAt')
+      }
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error ?? new Error('Failed to open video cache'))
+  })
+}
+
+async function getCachedVideoBlob(episodeId) {
+  if (!episodeId) return null
+  let db
+  try {
+    db = await openVideoCacheDb()
+    return await new Promise((resolve, reject) => {
+      const transaction = db.transaction(VIDEO_CACHE_STORE_NAME, 'readwrite')
+      const store = transaction.objectStore(VIDEO_CACHE_STORE_NAME)
+      const request = store.get(String(episodeId))
+      request.onsuccess = () => {
+        const record = request.result
+        if (record?.blob instanceof Blob) {
+          store.put({ ...record, updatedAt: Date.now() })
+        }
+        resolve(record?.blob instanceof Blob ? record.blob : null)
+      }
+      request.onerror = () => reject(request.error ?? new Error('Failed to read video cache'))
+    })
+  } catch {
+    return null
+  } finally {
+    db?.close()
+  }
+}
+
+async function putCachedVideoBlob(episodeId, blob) {
+  if (!episodeId || !(blob instanceof Blob)) return
+  let db
+  try {
+    db = await openVideoCacheDb()
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(VIDEO_CACHE_STORE_NAME, 'readwrite')
+      const store = transaction.objectStore(VIDEO_CACHE_STORE_NAME)
+      store.put({
+        episodeId: String(episodeId),
+        blob,
+        updatedAt: Date.now(),
+      })
+      const allRequest = store.getAll()
+      allRequest.onsuccess = () => {
+        const records = allRequest.result || []
+        if (records.length <= VIDEO_CACHE_MAX_ENTRIES) return
+
+        records
+          .filter((record) => record?.episodeId)
+          .sort((left, right) => Number(left.updatedAt || 0) - Number(right.updatedAt || 0))
+          .slice(0, records.length - VIDEO_CACHE_MAX_ENTRIES)
+          .forEach((record) => store.delete(record.episodeId))
+      }
+      transaction.oncomplete = () => resolve()
+      transaction.onerror = () => reject(transaction.error ?? new Error('Failed to write video cache'))
+      transaction.onabort = () => reject(transaction.error ?? new Error('Video cache write was aborted'))
+    })
+  } catch {
+    // Cache failures should not block annotation.
+  } finally {
+    db?.close()
+  }
+}
+
+function emitVideoChunkComplete(onChunkComplete, parts, loadedBytes, totalBytes, contentType, complete) {
+  onChunkComplete?.({
+    blob: new Blob(parts, { type: contentType }),
+    loadedBytes,
+    totalBytes,
+    complete,
+  })
+}
+
+async function fetchVideoAsBlob(url, signal, onProgress, onChunkComplete) {
   const parts = []
   let loadedBytes = 0
   let totalBytes = null
@@ -147,14 +240,22 @@ async function fetchVideoAsBlob(url, signal, onProgress) {
         continue
       }
 
-      if (totalBytes !== null && loadedBytes >= totalBytes) break
-      if (totalBytes === null && bytesRead > 0 && bytesRead < RANGE_CHUNK_SIZE) break
+      if (totalBytes !== null && loadedBytes >= totalBytes) {
+        emitVideoChunkComplete(onChunkComplete, parts, loadedBytes, totalBytes, contentType, true)
+        break
+      }
+      if (totalBytes === null && bytesRead > 0 && bytesRead < RANGE_CHUNK_SIZE) {
+        emitVideoChunkComplete(onChunkComplete, parts, loadedBytes, totalBytes, contentType, true)
+        break
+      }
       if (bytesRead === 0) throw new Error('Video range response contained no bytes')
+      emitVideoChunkComplete(onChunkComplete, parts, loadedBytes, totalBytes, contentType, false)
       rangeRetries = 0
       continue
     }
 
     if (response.status === 416 && loadedBytes > 0) {
+      emitVideoChunkComplete(onChunkComplete, parts, loadedBytes, totalBytes, contentType, true)
       break
     }
 
@@ -172,6 +273,7 @@ async function fetchVideoAsBlob(url, signal, onProgress) {
             loadedBytes += bytes.byteLength
             emitProgress()
           })
+          emitVideoChunkComplete(onChunkComplete, parts, loadedBytes, totalBytes, contentType, true)
           break
         } catch (error) {
           if (isAbortError(error) || !shouldRetryAfterProgress(loadedBytes > 0, fullRetries, FULL_RESPONSE_RETRY_LIMIT)) {
@@ -253,6 +355,7 @@ function canvasToJpegUrl(canvas) {
 }
 
 function LabelPage({ mode, onBack, onSignOut, project, user }) {
+  const [isModalOpen, setIsModalOpen] = useState(false)
   const videoRef = useRef(null)
   const thumbnailVideoRef = useRef(null)
   const thumbnailCanvasRef = useRef(null)
@@ -289,8 +392,19 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
     if (!Number.isFinite(duration) || duration <= 0) return 0
     return Math.max(1, Math.ceil(duration * annotationFps))
   }, [annotationFps, duration])
+  const videoUnblockedSeconds = useMemo(() => {
+    if (totalSeconds === 0) return 0
+    if (downloadState.status === 'ready' || downloadState.percent >= 100) return totalSeconds
+    if (downloadState.totalBytes && downloadState.loadedBytes) {
+      const ratio = clamp(downloadState.loadedBytes / downloadState.totalBytes, 0, 1)
+      return clamp(Math.floor(ratio * totalSeconds), 1, totalSeconds)
+    }
+    return 0
+  }, [downloadState.loadedBytes, downloadState.percent, downloadState.status, downloadState.totalBytes, totalSeconds])
 
   const maxWindowStart = Math.max(0, totalSeconds - 1)
+  const maxUnlockedSecond =
+    totalSeconds > 0 ? clamp(Math.max(0, videoUnblockedSeconds - 1), 0, maxWindowStart) : 0
   const windowStartFrame = totalSeconds > 0 ? clamp(windowStart, 0, maxWindowStart) : 0
   const windowStartSecond = windowStartFrame / annotationFps
   const playbackLoopStartFrame = totalSeconds > 0 ? Math.max(0, windowStartFrame - 1) : 0
@@ -306,9 +420,9 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
   const visibleSeconds = useMemo(() => {
     if (totalSeconds === 0) return []
     return Array.from({ length: FRAME_SECONDS }, (_, index) => windowStart + index).filter(
-      (second) => second >= 0 && second < totalSeconds
+      (second) => second >= 0 && second < totalSeconds && second <= maxUnlockedSecond
     )
-  }, [totalSeconds, windowStart])
+  }, [maxUnlockedSecond, totalSeconds, windowStart])
 
   const activeSecond =
     totalSeconds > 0 ? clamp(Math.floor(currentTime * annotationFps), 0, Math.max(0, totalSeconds - 1)) : 0
@@ -331,6 +445,20 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
   useEffect(() => {
     const controller = new AbortController()
     let objectUrl = ''
+    let latestObjectUrl = ''
+    const episodeId = project.activeTask?.id ?? project.activeTask?.oss_key ?? project.name
+
+    const activateVideoBlob = (blob) => {
+      if (controller.signal.aborted) return
+      const nextObjectUrl = URL.createObjectURL(blob)
+      const previousObjectUrl = latestObjectUrl
+      latestObjectUrl = nextObjectUrl
+      objectUrl = nextObjectUrl
+      setVideoUrl(nextObjectUrl)
+      if (previousObjectUrl) {
+        window.setTimeout(() => URL.revokeObjectURL(previousObjectUrl), 0)
+      }
+    }
 
     clearThumbnails()
     setVideoUrl('')
@@ -358,32 +486,68 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
       }
     }
 
-    fetchVideoAsBlob(project.videoSource, controller.signal, (progress) => {
-      setDownloadState((previous) => ({
-        ...previous,
-        ...progress,
-        status: progress.percent >= 100 ? 'ready' : 'loading',
-      }))
-    })
-      .then((blob) => {
+    async function loadVideo() {
+      try {
+        const cachedBlob = await getCachedVideoBlob(episodeId)
         if (controller.signal.aborted) return
-        objectUrl = URL.createObjectURL(blob)
-        setVideoUrl(objectUrl)
-      })
-      .catch((error) => {
+
+        if (cachedBlob) {
+          activateVideoBlob(cachedBlob)
+          setDownloadState({
+            status: 'ready',
+            loadedBytes: cachedBlob.size,
+            totalBytes: cachedBlob.size,
+            percent: 100,
+            text: 'Video ready from cache',
+          })
+          return
+        }
+
+        const blob = await fetchVideoAsBlob(
+          project.videoSource,
+          controller.signal,
+          (progress) => {
+            setDownloadState((previous) => ({
+              ...previous,
+              ...progress,
+              status: progress.percent >= 100 ? 'ready' : 'loading',
+            }))
+          },
+          (snapshot) => {
+            if (controller.signal.aborted) return
+            activateVideoBlob(snapshot.blob)
+            setDownloadState({
+              status: snapshot.complete ? 'ready' : 'loading',
+              loadedBytes: snapshot.loadedBytes,
+              totalBytes: snapshot.totalBytes,
+              percent: snapshot.totalBytes
+                ? clamp(Math.round((snapshot.loadedBytes / snapshot.totalBytes) * 100), 0, 100)
+                : 0,
+              text: snapshot.complete ? 'Video ready' : 'Downloading video...',
+            })
+          }
+        )
+        if (controller.signal.aborted) return
+
+        await putCachedVideoBlob(episodeId, blob)
+        if (controller.signal.aborted) return
+      } catch (error) {
         if (controller.signal.aborted) return
         setDownloadState((previous) => ({
           ...previous,
           status: 'error',
           text: error instanceof Error ? error.message : 'Video download failed',
         }))
-      })
+      }
+    }
+
+    void loadVideo()
 
     return () => {
       controller.abort()
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
+      if (latestObjectUrl || objectUrl) URL.revokeObjectURL(latestObjectUrl || objectUrl)
     }
-  }, [clearThumbnails, project.videoSource])
+  }, [clearThumbnails, project.activeTask?.id, project.activeTask?.oss_key, project.name, project.videoSource])
 
   useEffect(() => {
     if (!videoUrl) return undefined
@@ -417,7 +581,7 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
 
   useEffect(() => {
     if (totalSeconds === 0) return
-    setWindowStart((current) => clamp(current, 0, Math.max(0, totalSeconds - 1)))
+    setWindowStart((current) => clamp(current, 0, maxUnlockedSecond))
     setUnqualifiedSeconds((current) => {
       const next = new Set([...current].filter((second) => second < totalSeconds))
       return next.size === current.size ? current : next
@@ -426,7 +590,7 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
       const next = new Set([...current].filter((second) => second < totalSeconds))
       return next.size === current.size ? current : next
     })
-  }, [totalSeconds])
+  }, [maxUnlockedSecond, totalSeconds])
 
   useEffect(() => {
     if (visibleSeconds.length === 0) return
@@ -491,6 +655,7 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
       seconds.forEach((rawSecond) => {
         const second = Math.floor(rawSecond)
         if (second < 0 || second >= totalSeconds) return
+        if (second > maxUnlockedSecond) return
         if (thumbnailUrlsRef.current.has(second)) return
         if (pendingThumbnailsRef.current.has(second)) return
         pendingThumbnailsRef.current.add(second)
@@ -505,7 +670,7 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
       }
       void processThumbnailQueue()
     },
-    [processThumbnailQueue, thumbnailReady, totalSeconds]
+    [maxUnlockedSecond, processThumbnailQueue, thumbnailReady, totalSeconds]
   )
 
   useEffect(() => {
@@ -536,46 +701,21 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
     }
   }, [playbackLoopStart, totalSeconds, videoUrl])
 
-  const handleLoadedMetadata = useCallback(() => {
-    const video = videoRef.current
-    if (!video) return
-
-    const nextDuration = video.duration
-    if (Number.isFinite(nextDuration)) {
-      setDuration(nextDuration)
-    }
-    video.currentTime = playbackLoopStart
-    void video.play().catch(() => setIsPlaying(false))
-  }, [playbackLoopStart])
-
-  const handleTimeUpdate = useCallback(() => {
-    const video = videoRef.current
-    if (!video) return
-
-    setCurrentTime(video.currentTime)
-    setIsPlaying(!video.paused)
-
-    if (video.currentTime >= playbackLoopEnd - 0.03 || video.currentTime < playbackLoopStart) {
-      video.currentTime = playbackLoopStart
-      setCurrentTime(playbackLoopStart)
-      if (!video.paused) {
-        void video.play().catch(() => setIsPlaying(false))
-      }
-    }
-  }, [playbackLoopEnd, playbackLoopStart])
-
   const seekWindowBy = useCallback(
     (delta) => {
       if (totalSeconds === 0) return
-      setWindowStart((current) => clamp(current + delta, 0, Math.max(0, totalSeconds - 1)))
+      setWindowStart((current) => {
+        const next = current + delta
+        return clamp(next, 0, maxUnlockedSecond)
+      })
     },
-    [totalSeconds]
+    [maxUnlockedSecond, totalSeconds]
   )
 
   const seekToSecond = useCallback(
     (second) => {
       if (totalSeconds === 0) return
-      const target = clamp(second, 0, Math.max(0, totalSeconds - 1))
+      const target = clamp(second, 0, maxUnlockedSecond)
       const video = videoRef.current
       const targetTime = target / annotationFps
       setWindowStart(target)
@@ -588,8 +728,48 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
         }
       }
     },
-    [annotationFps, totalSeconds]
+    [annotationFps, maxUnlockedSecond, totalSeconds]
   )
+
+  const togglePlayback = useCallback(() => {
+    const video = videoRef.current
+    if (!video || !videoUrl) return
+    setIsPlaying((current) => {
+      const next = !current
+      if (next) {
+        video.play().catch(() => setIsPlaying(false))
+      } else {
+        video.pause()
+      }
+      return next
+    })
+  }, [videoUrl])
+
+  const handleTimeUpdate = useCallback(() => {
+    const video = videoRef.current
+    if (!video) return
+    const now = video.currentTime
+    if (now >= playbackLoopEnd) {
+      const stayPaused = video.paused
+      video.currentTime = playbackLoopStart
+      if (!stayPaused) {
+        void video.play().catch(() => setIsPlaying(false))
+      }
+    }
+    setCurrentTime(now)
+  }, [playbackLoopEnd, playbackLoopStart])
+
+  const handleLoadedMetadata = useCallback(() => {
+    const video = videoRef.current
+    if (!video) return
+
+    const nextDuration = video.duration
+    if (Number.isFinite(nextDuration)) {
+      setDuration(nextDuration)
+    }
+    video.currentTime = playbackLoopStart
+    void video.play().catch(() => setIsPlaying(false))
+  }, [playbackLoopStart])
 
   const toggleQuality = useCallback((second) => {
     setUnqualifiedSeconds((current) => {
@@ -606,19 +786,6 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
       next.add(second)
       return next
     })
-  }, [])
-
-  const togglePlayback = useCallback(() => {
-    const video = videoRef.current
-    if (!video) return
-
-    if (video.paused) {
-      setIsPlaying(true)
-      void video.play().catch(() => setIsPlaying(false))
-    } else {
-      video.pause()
-      setIsPlaying(false)
-    }
   }, [])
 
   const handleSubmit = useCallback(async () => {
@@ -668,18 +835,17 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
         message: error instanceof Error ? error.message : '提交失败',
       })
     }
-  }, [annotationFps, duration, mode, project.activeTask, project.id, unqualifiedSeconds, user.email, user.role, visitedSeconds])
-
-  const handleTimelineClick = useCallback(
-    (event) => {
-      if (totalSeconds === 0) return
-      const rect = event.currentTarget.getBoundingClientRect()
-      const ratio = clamp((event.clientX - rect.left) / rect.width, 0, 1)
-      const target = Math.floor(ratio * Math.max(1, totalSeconds - 1))
-      seekToSecond(target)
-    },
-    [seekToSecond, totalSeconds]
-  )
+  }, [
+    annotationFps,
+    duration,
+    mode,
+    project.activeTask,
+    project.id,
+    unqualifiedSeconds,
+    user.email,
+    user.role,
+    visitedSeconds,
+  ])
 
   useEffect(() => {
     const handleKeyDown = (event) => {
@@ -723,6 +889,17 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
     }
   }, [clearThumbnails])
 
+  const handleTimelineClick = useCallback(
+    (event) => {
+      if (totalSeconds === 0) return
+      const rect = event.currentTarget.getBoundingClientRect()
+      const ratio = clamp((event.clientX - rect.left) / rect.width, 0, 1)
+      const target = Math.floor(ratio * Math.max(1, totalSeconds - 1))
+      seekToSecond(target)
+    },
+    [seekToSecond, totalSeconds]
+  )
+
   const renderThumbnail = (second, variant = 'main') => {
     const imageUrl = thumbnails[second]
     const isUnqualified = unqualifiedSeconds.has(second)
@@ -765,7 +942,10 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
   }
 
   const previousPreviewSecond = windowStart > 0 ? windowStart - 1 : null
-  const nextPreviewSecond = windowStart + FRAME_SECONDS < totalSeconds ? windowStart + FRAME_SECONDS : null
+  const nextPreviewSecond =
+    windowStart + FRAME_SECONDS < totalSeconds && windowStart + FRAME_SECONDS <= maxUnlockedSecond
+      ? windowStart + FRAME_SECONDS
+      : null
   const timelineFrames = useMemo(
     () => Array.from({ length: totalSeconds }, (_, second) => second),
     [totalSeconds]
@@ -778,6 +958,9 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
           <img className="brand-mark" alt="videoSight" src={logoUrl} />
           <span className="brand-name">videoSight</span>
           <span className="brand-tag">local</span>
+          <button className="analysis-button" onClick={() => setIsModalOpen(true)} type="button">
+            手势轨迹统计
+          </button>
         </div>
         <div className="top-actions">
           <button className="ghost-button" onClick={onBack} type="button">
@@ -836,6 +1019,7 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
           <span>
             Visited {visitedSeconds.size}/{totalSeconds || 0} ({visitedPercent}%)
           </span>
+          <span>Unlocked {Math.min(videoUnblockedSeconds, totalSeconds || 0)}/{totalSeconds || 0}</span>
           <span>Qualified {qualifiedCount}</span>
           <span>Unqualified {unqualifiedSeconds.size}</span>
         </section>
@@ -924,6 +1108,10 @@ function LabelPage({ mode, onBack, onSignOut, project, user }) {
               : '提交标注'}
         </button>
       </footer>
+
+      {isModalOpen && (
+        <HandposeChartModal taskId={project.activeTask?.id} onClose={() => setIsModalOpen(false)} />
+      )}
     </div>
   )
 }
