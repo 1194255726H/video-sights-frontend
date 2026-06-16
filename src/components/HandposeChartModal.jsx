@@ -16,7 +16,7 @@ const COLORS = {
   y: '#28c58f',
   z: '#f28a3e',
 }
-const CHART_WIDTH = 920
+const CHART_WIDTH = 960
 const CHART_HEIGHT = 390
 const PADDING = { top: 24, right: 28, bottom: 42, left: 58 }
 
@@ -41,12 +41,15 @@ function pickInitialHand(meta) {
   return Object.keys(meta)[0] ?? ''
 }
 
-function getChartBounds(series) {
+function getChartBounds(series, fallbackSeries = []) {
   const values = series.flatMap((line) => line.points.map((point) => point.value)).filter(Number.isFinite)
-  if (values.length === 0) return null
+  const boundValues = values.length > 0
+    ? values
+    : fallbackSeries.flatMap((line) => line.points.map((point) => point.value)).filter(Number.isFinite)
+  if (boundValues.length === 0) return null
 
-  const min = Math.min(...values)
-  const max = Math.max(...values)
+  const min = Math.min(...boundValues)
+  const max = Math.max(...boundValues)
   const pad = Math.max((max - min) * 0.08, 0.0001)
   return {
     min: min - pad,
@@ -72,11 +75,11 @@ function makePath(points, xScale, yScale) {
   return chunks.join(' ')
 }
 
-function buildSeries(data, visibleAxes) {
+function buildSeries(data, visibleAxes, visibleLines) {
   if (!data?.frame_indices?.length) return []
 
   return AXES.filter((axis) => visibleAxes[axis]).flatMap((axis) =>
-    ['original', 'filtered'].map((kind) => ({
+    ['original', 'filtered'].filter((kind) => visibleLines[kind]).map((kind) => ({
       key: `${kind}_${axis}`,
       axis,
       kind,
@@ -88,10 +91,18 @@ function buildSeries(data, visibleAxes) {
   )
 }
 
-function HandposeLineChart({ data, visibleAxes }) {
+function HandposeLineChart({ data, visibleAxes, visibleLines }) {
   const [hoverIndex, setHoverIndex] = useState(null)
-  const series = useMemo(() => buildSeries(data, visibleAxes), [data, visibleAxes])
-  const bounds = useMemo(() => getChartBounds(series), [series])
+  const series = useMemo(() => buildSeries(data, visibleAxes, visibleLines), [data, visibleAxes, visibleLines])
+  const boundsSeries = useMemo(
+    () => buildSeries(data, visibleAxes, { original: true, filtered: true }),
+    [data, visibleAxes]
+  )
+  const allSeries = useMemo(
+    () => buildSeries(data, { x: true, y: true, z: true }, { original: true, filtered: true }),
+    [data]
+  )
+  const bounds = useMemo(() => getChartBounds(boundsSeries, allSeries), [allSeries, boundsSeries])
   const frames = data?.frame_indices ?? []
 
   if (!bounds || frames.length === 0) {
@@ -252,6 +263,7 @@ export default function HandposeChartModal({ taskId, onClose }) {
   const [dataLoading, setDataLoading] = useState(false)
   const [error, setError] = useState('')
   const [visibleAxes, setVisibleAxes] = useState({ x: true, y: true, z: true })
+  const [visibleLines, setVisibleLines] = useState({ original: true, filtered: true })
 
   useEffect(() => {
     let ignore = false
@@ -392,6 +404,25 @@ export default function HandposeChartModal({ taskId, onClose }) {
               </label>
             ))}
           </div>
+          <span className="handpose-toolbar-divider" />
+            <div className="handpose-axis-toggle" aria-label="线条显示">
+              <label>
+                <input
+                  checked={visibleLines.original}
+                  onChange={(e) => setVisibleLines((c) => ({ ...c, original: e.target.checked }))}
+                  type="checkbox"
+                />
+                <span>原始</span>
+              </label>
+              <label>
+                <input
+                  checked={visibleLines.filtered}
+                  onChange={(e) => setVisibleLines((c) => ({ ...c, filtered: e.target.checked }))}
+                  type="checkbox"
+                />
+                <span>修正后</span>
+              </label>
+            </div>
         </div>
 
         <div className="handpose-summary">
@@ -403,7 +434,7 @@ export default function HandposeChartModal({ taskId, onClose }) {
         <div className="handpose-chart-panel">
           {isLoading && <div className="handpose-state">正在加载手势轨迹...</div>}
           {!isLoading && error && <div className="handpose-state error">{error}</div>}
-          {!isLoading && !error && <HandposeLineChart data={chartData} visibleAxes={visibleAxes} />}
+          {!isLoading && !error && <HandposeLineChart data={chartData} visibleAxes={visibleAxes} visibleLines={visibleLines} />}
         </div>
 
         <div className="handpose-legend">
@@ -413,8 +444,16 @@ export default function HandposeChartModal({ taskId, onClose }) {
               {AXIS_LABELS[axis]}
             </span>
           ))}
-          <span className="line-sample dashed" /> 原始
-          <span className="line-sample" /> 修正后
+          {visibleLines.original && (
+            <span className="legend-item">
+              <span className="line-sample dashed" /> 原始
+            </span>
+          )}
+          {visibleLines.filtered && (
+            <span className="legend-item">
+              <span className="line-sample" /> 修正后
+            </span>
+          )}
         </div>
       </section>
     </div>
