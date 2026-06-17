@@ -648,11 +648,13 @@
 }
 
 .project-shell {
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   background: #f6f8fb;
   color: #1f2937;
+  overflow: hidden;
 }
 
 .project-header {
@@ -752,8 +754,11 @@
 
 .project-table-wrap {
   min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   padding: 12px;
-  overflow: auto;
+  overflow: hidden;
 }
 
 .project-toolbar {
@@ -894,8 +899,12 @@
 }
 
 .history-section {
+  min-height: 0;
+  height: 100%;
   display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 14px;
+  overflow: hidden;
 }
 
 .history-heading,
@@ -995,9 +1004,16 @@
 }
 
 .history-grid {
+  min-height: 0;
+  height: 100%;
+  padding-right: 4px;
   display: grid;
   grid-template-columns: repeat(4, minmax(240px, 1fr));
+  align-content: start;
   gap: 14px;
+  overflow-x: hidden;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
 }
 
 .history-card {
@@ -1021,8 +1037,8 @@
   overflow: hidden;
   color: #111827;
   font-size: 13px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .history-check {

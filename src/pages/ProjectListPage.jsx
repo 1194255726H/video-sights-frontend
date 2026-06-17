@@ -14,6 +14,16 @@ function ProjectListPage({
   const [keyword, setKeyword] = useState('')
   const [activeTab, setActiveTab] = useState('all')
 
+  const getStatusLabel = (project) => {
+    if (project.raw?.audit_passed === true) return '审核通过'
+    if (project.raw?.audit_passed === false) return '审核未通过'
+    if (project.raw?.status === 'completed') return '已完成'
+    if (project.raw?.status === 'in_progress') return '标注中'
+    if (project.raw?.status === 'pending') return '待标注'
+    if (project.raw?.status) return project.raw.status
+    return '待处理'
+  }
+
   const filteredProjects = useMemo(() => {
     const text = keyword.trim().toLowerCase()
     const searchedProjects = text
@@ -35,10 +45,10 @@ function ProjectListPage({
   const canAnnotate = user.role === 'admin' || user.role === 'annotator'
   const canReview = user.role === 'admin' || user.role === 'reviewer'
   const tabs = [
-    { key: 'all', label: 'All' },
-    { key: 'voting', label: 'Voting' },
-    { key: 'completed', label: 'Completed' },
-    { key: 'audited', label: 'Audited' },
+    { key: 'all', label: '全部' },
+    { key: 'voting', label: '待标注' },
+    { key: 'completed', label: '已完成' },
+    { key: 'audited', label: '已审核' },
   ]
 
   return (
@@ -117,7 +127,7 @@ function ProjectListPage({
               />
             </label>
             <span className="history-count">
-              Showing {filteredProjects.length} of {projects.length}
+              共 {projects.length} 个任务，当前显示 {filteredProjects.length} 个
             </span>
           </div>
 
@@ -135,10 +145,10 @@ function ProjectListPage({
                     {/* <span className="history-check">✓</span> */}
                   </div>
                   <p>
-                    {isCompleted ? 'Completed' : project.raw?.status || 'Pending'} <span>{project.createdAt}</span>
+                    {getStatusLabel(project)} <span>{project.createdAt}</span>
                   </p>
                   <div className="history-progress-row">
-                    <span>PROGRESS</span>
+                    <span>进度</span>
                     <span>
                       {completed}/{total} - {progress}%
                     </span>
@@ -154,7 +164,7 @@ function ProjectListPage({
                         onClick={() => onStartReview(project)}
                         type="button"
                       >
-                        Review
+                        审核
                       </button>
                     ) : null}
                     {canAnnotate && project.raw?.status !== 'completed' ? (
@@ -164,7 +174,7 @@ function ProjectListPage({
                         onClick={() => onStartAnnotation(project)}
                         type="button"
                       >
-                        Annotate
+                        标注
                       </button>
                     ) : null}
                   </div>
