@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { backendApi } from '../api/backend'
 
 const AXES = ['x', 'y', 'z']
@@ -75,6 +75,20 @@ function makePath(points, xScale, yScale) {
   return chunks.join(' ')
 }
 
+function makePointPath(points, xScale, yScale) {
+  const chunks = []
+
+  points.forEach((point) => {
+    if (!Number.isFinite(point.value)) return
+
+    const x = xScale(point.frame).toFixed(2)
+    const y = yScale(point.value)
+    chunks.push(`M${x},${(y - 2.2).toFixed(2)}L${x},${(y + 2.2).toFixed(2)}`)
+  })
+
+  return chunks.join(' ')
+}
+
 function buildSeries(data, visibleAxes, visibleLines) {
   if (!data?.frame_indices?.length) return []
 
@@ -91,8 +105,188 @@ function buildSeries(data, visibleAxes, visibleLines) {
   )
 }
 
-function HandposeLineChart({ data, visibleAxes, visibleLines }) {
+function countFiniteValues(values = []) {
+  return values.filter(Number.isFinite).length
+}
+
+const HandposeStaticLayer = memo(function HandposeStaticLayer({
+  bounds,
+  frames,
+  plotHeight,
+  plotWidth,
+  series,
+  xScale,
+  yScale,
+}) {
+  const minFrame = frames[0]
+  const maxFrame = frames[frames.length - 1]
+  const yTicks = Array.from({ length: 5 }, (_, index) => bounds.min + ((bounds.max - bounds.min) * index) / 4)
+  const xTicks = Array.from({ length: 5 }, (_, index) => Math.round(minFrame + ((maxFrame - minFrame) * index) / 4))
+
+  return (
+    <>
+      <rect
+        className="handpose-plot-bg"
+        height={plotHeight}
+        width={plotWidth}
+        x={PADDING.left}
+        y={PADDING.top}
+      />
+
+      {yTicks.map((tick) => {
+        const y = yScale(tick)
+        return (
+          <g key={`y-${tick}`}>
+            <line className="handpose-grid-line" x1={PADDING.left} x2={CHART_WIDTH - PADDING.right} y1={y} y2={y} />
+            <text className="handpose-axis-text" textAnchor="end" x={PADDING.left - 10} y={y + 4}>
+              {formatNumber(tick)}
+            </text>
+          </g>
+        )
+      })}
+
+      {xTicks.map((tick) => {
+        const x = xScale(tick)
+        return (
+          <g key={`x-${tick}`}>
+            <line className="handpose-grid-line soft" x1={x} x2={x} y1={PADDING.top} y2={CHART_HEIGHT - PADDING.bottom} />
+            <text className="handpose-axis-text" textAnchor="middle" x={x} y={CHART_HEIGHT - 16}>
+              {tick}
+            </text>
+          </g>
+        )
+      })}
+
+      {series.map((line) => (
+        <path
+          className="handpose-data-line"
+          d={makePath(line.points, xScale, yScale)}
+          fill="none"
+          key={line.key}
+          stroke={COLORS[line.axis]}
+          strokeDasharray={LINE_STYLES[line.kind].dash}
+        />
+      ))}
+
+      {series.filter((line) => line.kind === 'original').map((line) => (
+        <path
+          className="handpose-data-points"
+          d={makePointPath(line.points, xScale, yScale)}
+          fill="none"
+          key={`${line.key}-points`}
+          stroke={COLORS[line.axis]}
+        />
+      ))}
+    </>
+  )
+})
+
+function HandposeHoverLayer({ data, frames, plotHeight, plotWidth, series, visibleAxes, xScale, yScale }) {
   const [hoverIndex, setHoverIndex] = useState(null)
+  const pendingIndexRef = useRef(null)
+  const frameRef = useRef(null)
+  const hoverPoint = hoverIndex === null ? null : {
+    frame: frames[hoverIndex],
+    timestamp: data?.timestamps?.[hoverIndex] ?? null,
+    x: xScale(frames[hoverIndex]),
+  }
+  const tooltipRows = hoverPoint
+    ? AXES.filter((axis) => visibleAxes[axis]).map((axis) => ({
+        axis,
+        original: data?.original?.[axis]?.[hoverIndex],
+        filtered: data?.filtered?.[axis]?.[hoverIndex],
+      }))
+    : []
+  const tooltipWidth = 230
+  const tooltipHeight = 54 + tooltipRows.length * 24
+  const tooltipX = hoverPoint && hoverPoint.x > CHART_WIDTH - PADDING.right - tooltipWidth - 12
+    ? hoverPoint.x - tooltipWidth - 12
+    : (hoverPoint?.x ?? PADDING.left) + 12
+  const tooltipY = PADDING.top + 10
+
+  const handlePointerMove = useCallback((event) => {
+    const rect = event.currentTarget.getBoundingClientRect()
+    const viewBoxX = ((event.clientX - rect.left) / Math.max(rect.width, 1)) * CHART_WIDTH
+    const clampedX = Math.max(PADDING.left, Math.min(CHART_WIDTH - PADDING.right, viewBoxX))
+    const ratio = (clampedX - PADDING.left) / Math.max(plotWidth, 1)
+    const nextIndex = Math.max(0, Math.min(frames.length - 1, Math.round(ratio * (frames.length - 1))))
+    pendingIndexRef.current = nextIndex
+
+    if (frameRef.current !== null) return
+    frameRef.current = window.requestAnimationFrame(() => {
+      frameRef.current = null
+      setHoverIndex((current) => (current === pendingIndexRef.current ? current : pendingIndexRef.current))
+    })
+  }, [frames.length, plotWidth])
+
+  const handlePointerLeave = useCallback(() => {
+    if (frameRef.current !== null) {
+      window.cancelAnimationFrame(frameRef.current)
+      frameRef.current = null
+    }
+    pendingIndexRef.current = null
+    setHoverIndex(null)
+  }, [])
+
+  useEffect(() => () => {
+    if (frameRef.current !== null) window.cancelAnimationFrame(frameRef.current)
+  }, [])
+
+  return (
+    <>
+      {hoverPoint && (
+        <g className="handpose-hover-layer">
+          <line
+            className="handpose-hover-line"
+            x1={hoverPoint.x}
+            x2={hoverPoint.x}
+            y1={PADDING.top}
+            y2={CHART_HEIGHT - PADDING.bottom}
+          />
+          {series.map((line) => {
+            const point = line.points[hoverIndex]
+            if (!Number.isFinite(point?.value)) return null
+            return (
+              <circle
+                className="handpose-hover-dot"
+                cx={hoverPoint.x}
+                cy={yScale(point.value)}
+                fill={COLORS[line.axis]}
+                key={`${line.key}-hover`}
+                r={line.kind === 'filtered' ? 4 : 3}
+              />
+            )
+          })}
+          <foreignObject height={tooltipHeight} width={tooltipWidth} x={tooltipX} y={tooltipY}>
+            <div className="handpose-tooltip">
+              <strong>帧 {hoverPoint.frame}</strong>
+              <span>时间戳：{hoverPoint.timestamp ?? '-'}</span>
+              {tooltipRows.map((row) => (
+                <span className="handpose-tooltip-row" key={row.axis}>
+                  <b style={{ color: COLORS[row.axis] }}>{AXIS_LABELS[row.axis]}</b>
+                  <span>原始 {formatNumber(row.original)}</span>
+                  <span>修正 {formatNumber(row.filtered)}</span>
+                </span>
+              ))}
+            </div>
+          </foreignObject>
+        </g>
+      )}
+
+      <rect
+        className="handpose-hover-capture"
+        height={plotHeight}
+        onPointerLeave={handlePointerLeave}
+        onPointerMove={handlePointerMove}
+        width={plotWidth}
+        x={PADDING.left}
+        y={PADDING.top}
+      />
+    </>
+  )
+}
+
+function HandposeLineChart({ data, visibleAxes, visibleLines }) {
   const series = useMemo(() => buildSeries(data, visibleAxes, visibleLines), [data, visibleAxes, visibleLines])
   const boundsSeries = useMemo(
     () => buildSeries(data, visibleAxes, { original: true, filtered: true }),
@@ -117,35 +311,6 @@ function HandposeLineChart({ data, visibleAxes, visibleLines }) {
     PADDING.left + ((frame - minFrame) / Math.max(maxFrame - minFrame, 1)) * plotWidth
   const yScale = (value) =>
     PADDING.top + (1 - (value - bounds.min) / Math.max(bounds.max - bounds.min, 0.0001)) * plotHeight
-  const yTicks = Array.from({ length: 5 }, (_, index) => bounds.min + ((bounds.max - bounds.min) * index) / 4)
-  const xTicks = Array.from({ length: 5 }, (_, index) => Math.round(minFrame + ((maxFrame - minFrame) * index) / 4))
-  const hoverPoint = hoverIndex === null ? null : {
-    frame: frames[hoverIndex],
-    timestamp: data?.timestamps?.[hoverIndex] ?? null,
-    x: xScale(frames[hoverIndex]),
-  }
-  const tooltipRows = hoverPoint
-    ? AXES.filter((axis) => visibleAxes[axis]).map((axis) => ({
-        axis,
-        original: data?.original?.[axis]?.[hoverIndex],
-        filtered: data?.filtered?.[axis]?.[hoverIndex],
-      }))
-    : []
-  const tooltipWidth = 230
-  const tooltipHeight = 54 + tooltipRows.length * 24
-  const tooltipX = hoverPoint && hoverPoint.x > CHART_WIDTH - PADDING.right - tooltipWidth - 12
-    ? hoverPoint.x - tooltipWidth - 12
-    : (hoverPoint?.x ?? PADDING.left) + 12
-  const tooltipY = PADDING.top + 10
-
-  const handlePointerMove = (event) => {
-    const rect = event.currentTarget.getBoundingClientRect()
-    const viewBoxX = ((event.clientX - rect.left) / Math.max(rect.width, 1)) * CHART_WIDTH
-    const clampedX = Math.max(PADDING.left, Math.min(CHART_WIDTH - PADDING.right, viewBoxX))
-    const ratio = (clampedX - PADDING.left) / Math.max(plotWidth, 1)
-    const nextIndex = Math.max(0, Math.min(frames.length - 1, Math.round(ratio * (frames.length - 1))))
-    setHoverIndex((current) => (current === nextIndex ? current : nextIndex))
-  }
 
   return (
     <div className="handpose-chart-wrap">
@@ -155,99 +320,29 @@ function HandposeLineChart({ data, visibleAxes, visibleLines }) {
         role="img"
         viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
       >
-        <rect
-          className="handpose-plot-bg"
-          height={plotHeight}
-          width={plotWidth}
-          x={PADDING.left}
-          y={PADDING.top}
+        <HandposeStaticLayer
+          bounds={bounds}
+          frames={frames}
+          plotHeight={plotHeight}
+          plotWidth={plotWidth}
+          series={series}
+          xScale={xScale}
+          yScale={yScale}
         />
-
-        {yTicks.map((tick) => {
-          const y = yScale(tick)
-          return (
-            <g key={`y-${tick}`}>
-              <line className="handpose-grid-line" x1={PADDING.left} x2={CHART_WIDTH - PADDING.right} y1={y} y2={y} />
-              <text className="handpose-axis-text" textAnchor="end" x={PADDING.left - 10} y={y + 4}>
-                {formatNumber(tick)}
-              </text>
-            </g>
-          )
-        })}
-
-        {xTicks.map((tick) => {
-          const x = xScale(tick)
-          return (
-            <g key={`x-${tick}`}>
-              <line className="handpose-grid-line soft" x1={x} x2={x} y1={PADDING.top} y2={CHART_HEIGHT - PADDING.bottom} />
-              <text className="handpose-axis-text" textAnchor="middle" x={x} y={CHART_HEIGHT - 16}>
-                {tick}
-              </text>
-            </g>
-          )
-        })}
-
-        {series.map((line) => (
-          <path
-            className="handpose-data-line"
-            d={makePath(line.points, xScale, yScale)}
-            fill="none"
-            key={line.key}
-            stroke={COLORS[line.axis]}
-            strokeDasharray={LINE_STYLES[line.kind].dash}
-          />
-        ))}
-
-        {hoverPoint && (
-          <g className="handpose-hover-layer">
-            <line
-              className="handpose-hover-line"
-              x1={hoverPoint.x}
-              x2={hoverPoint.x}
-              y1={PADDING.top}
-              y2={CHART_HEIGHT - PADDING.bottom}
-            />
-            {series.map((line) => {
-              const point = line.points[hoverIndex]
-              if (!Number.isFinite(point?.value)) return null
-              return (
-                <circle
-                  className="handpose-hover-dot"
-                  cx={hoverPoint.x}
-                  cy={yScale(point.value)}
-                  fill={COLORS[line.axis]}
-                  key={`${line.key}-hover`}
-                  r={line.kind === 'filtered' ? 4 : 3}
-                />
-              )
-            })}
-            <foreignObject height={tooltipHeight} width={tooltipWidth} x={tooltipX} y={tooltipY}>
-              <div className="handpose-tooltip">
-                <strong>帧 {hoverPoint.frame}</strong>
-                <span>时间戳：{hoverPoint.timestamp ?? '-'}</span>
-                {tooltipRows.map((row) => (
-                  <span className="handpose-tooltip-row" key={row.axis}>
-                    <b style={{ color: COLORS[row.axis] }}>{AXIS_LABELS[row.axis]}</b>
-                    <span>原始 {formatNumber(row.original)}</span>
-                    <span>修正 {formatNumber(row.filtered)}</span>
-                  </span>
-                ))}
-              </div>
-            </foreignObject>
-          </g>
-        )}
 
         <text className="handpose-axis-title" textAnchor="middle" x={CHART_WIDTH / 2} y={CHART_HEIGHT - 4}>
           帧序号
         </text>
-        <rect
-          className="handpose-hover-capture"
-          height={plotHeight}
-          onPointerLeave={() => setHoverIndex(null)}
-          onPointerMove={handlePointerMove}
-          width={plotWidth}
-          x={PADDING.left}
-          y={PADDING.top}
+
+        <HandposeHoverLayer
+          data={data}
+          frames={frames}
+          plotHeight={plotHeight}
+          plotWidth={plotWidth}
+          series={series}
+          visibleAxes={visibleAxes}
+          xScale={xScale}
+          yScale={yScale}
         />
       </svg>
     </div>
@@ -332,6 +427,7 @@ export default function HandposeChartModal({ taskId, onClose }) {
 
   const jointOptions = meta[hand] ?? []
   const isLoading = metaLoading || dataLoading
+  const originalValueCount = countFiniteValues(chartData?.original?.x)
 
   return (
     <div className="handpose-modal-overlay" onClick={onClose}>
@@ -427,6 +523,7 @@ export default function HandposeChartModal({ taskId, onClose }) {
 
         <div className="handpose-summary">
           <span>帧数：{chartData?.frame_count ?? '-'}</span>
+          <span>原始有效帧：{chartData ? originalValueCount : '-'}</span>
           <span>当前：{HAND_LABELS[hand] || hand || '-'} / {joint || '-'}</span>
           <span>空帧：原始线条会在缺失处断开</span>
         </div>

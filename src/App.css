@@ -1280,6 +1280,11 @@
   stroke-linejoin: round;
 }
 
+.handpose-data-points {
+  stroke-linecap: round;
+  stroke-width: 4.4;
+}
+
 .handpose-hover-capture {
   cursor: crosshair;
   fill: transparent;
